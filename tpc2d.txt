@@ -1,0 +1,270 @@
+#include <cstdlib>
+#include <iostream>
+#include <fstream>
+
+#include <TApplication.h>
+#include <TCanvas.h>
+#include <TH1F.h>
+
+#include "Garfield/ViewCell.hh"
+#include "Garfield/ViewSignal.hh"
+#include "Garfield/ComponentAnalyticField.hh"
+#include "Garfield/ViewField.hh"
+#include "Garfield/MediumMagboltz.hh"
+#include "Garfield/Sensor.hh"
+#include "Garfield/AvalancheMicroscopic.hh"
+#include "Garfield/AvalancheMC.hh"
+#include "Garfield/ViewDrift.hh"
+#include "Garfield/DriftLineRKF.hh"
+#include "Garfield/Random.hh"
+#include "Garfield/ComponentGrid.hh"
+
+using namespace Garfield;
+
+int main(int argc, char * argv[]) {
+
+  TApplication app("app", &argc, argv);
+
+  //variables to change
+  constexpr bool saveData = false;
+  //grid pitch (30 lpi or 70 lpi)
+  constexpr bool lpi30 = false;
+  //number of rings
+  constexpr int  numRings = 10;
+  //drift length [cm]
+  constexpr double driftLength = 5.;
+  //inner diameter of the rings [cm]
+  constexpr double ringInnerDiam = 2.5;
+  //thickness of the rings [cm]
+  constexpr double ringThickness = 0.1;
+  //gap between the grid and the first ring [cm]
+  constexpr double egGap = 0.162;
+  // wire diameter [cm]
+  constexpr double gridDiam = 0.0035;
+  //thickness of the anode
+  constexpr double anodeThickness = 0.1;
+  //thickness of the cathode
+  constexpr double cathodeThickness = 0.1;
+  //electric field between the anode grid and cathode grid [V/cm]
+  constexpr double eGG = 400;
+  //electric field between the anode and the grid [V/cm]
+  constexpr double eAG = 800;
+  //electric field between the cathode and the grid [V/cm]
+  constexpr double eCG = 200;
+  //grid or gridless?
+  constexpr bool yesGrid = true;
+  //number of electrons to eject
+  const int nIons = 10;  
+
+  //grid spacing [cm]
+  constexpr double gridGap = lpi30 ? 0.0846: 0.0363;
+  // number of grid wires
+  constexpr int numGridWire = (ringInnerDiam-ringThickness)/gridGap;
+  std::cout<<numGridWire<<std::endl;
+  //spacing between the rings
+  constexpr double ringGap = driftLength/(numRings+1);
+
+  // yGrid placement [cm]
+  constexpr double yLowerGrid = egGap;
+  constexpr double yUpperGrid = driftLength + yLowerGrid;
+
+   //electrode placement [cm]
+  constexpr double yCathode = yUpperGrid + egGap;
+  constexpr double yAnode = 0.;
+  
+  // voltage settings [V], lower grid set at ground
+  constexpr double vAnode = yesGrid? eAG*egGap: 0;
+  constexpr double vLowerGrid = 0;
+  constexpr double vUpperGrid = -(driftLength*eGG);
+  constexpr double vCathode = yesGrid? vUpperGrid - eCG*egGap: -yCathode*eGG;
+  
+  //setup the gas
+  MediumMagboltz gas;
+
+  //set the temperature [K] and pressure [Torr].
+  //100% xenon gas
+  gas.SetComposition("xe", 100.);
+  //temperature [K]
+  gas.SetTemperature(120);
+  //pressure [Torr]
+  gas.SetPressure(1125.);
+  //initialize table of scattering rates (called internally when a collision rate is requested and the gas mixture or other parameters have changed)
+  gas.Initialise(false);  
+
+  //number of electrons produced in initial avalanche
+  int initElectronTotal = 0;
+  //number of electrons that end up at the anode
+  int finalElectronTotal = 0;
+  
+  //load the ion mobilities.
+  const std::string path = std::getenv("GARFIELD_INSTALL");
+  gas.LoadIonMobility(path + "/share/Garfield/Data/IonMobility_Xe+_P12_Xe.txt");
+  gas.LoadGasFile("xe1125Torr.gas");
+  
+  //setup field
+  ComponentAnalyticField cmp;
+  cmp.SetMedium(&gas);
+
+  //add electrodes
+  cmp.AddPlaneY(yAnode, vAnode, "anode");
+  cmp.AddStripOnPlaneY('x', yAnode, 1.25-0.5, 1.25+0.5, "anode");
+  cmp.AddPlaneY(yCathode, vCathode, "cathode");
+  cmp.AddStripOnPlaneY('x', yCathode, 1.25-0.5, 1.25+0.5, "cathode");
+ 
+  Sensor sensor;
+  sensor.AddComponent(&cmp);
+  //add electrode that will measure induced current
+  sensor.AddElectrode(&cmp, "anode");
+  //set drift region
+  sensor.SetArea();
+
+  int nSteps = 50000;
+  //setup binning for signal calculation [ns]
+  sensor.SetTimeWindow(0., 1, nSteps);
+  
+  //add grids
+  if (yesGrid == true) {
+    for (int i=0; i<numGridWire; i++) {
+      cmp.AddWire(0+i*gridGap, yLowerGrid, gridDiam, vLowerGrid, "lowergrid");
+      cmp.AddWire(0+i*gridGap, yUpperGrid, gridDiam, vUpperGrid, "uppergrid");
+    }
+  }
+ 
+  //add rings
+  for (int i=0; i<numRings; i++) {
+    std::ostringstream oss;
+    oss << "ring" << i+1;
+    std::string label = oss.str();
+    double v =(i+1)*(vUpperGrid/(numRings+1));
+    cmp.AddWire(-ringThickness/2, yLowerGrid+(i+1)*ringGap, ringThickness, v, label);
+    cmp.AddWire(ringInnerDiam, yLowerGrid+(i+1)*ringGap, ringThickness, v, label);
+    }
+
+  //drift line rkf to drift electrons -> calculates path of electron or ion by numerical integration of drift velocity vector, well adapted to smooth fields (e.g. analytic potentials)
+  DriftLineRKF driftline;
+  driftline.SetSensor(&sensor);
+
+  //enable plotting drift lines
+  ViewDrift driftView;
+  driftline.EnablePlotting(&driftView);
+
+  //drift electrons using RKF method
+  int plane = 0;
+  for (int i = 0; i<nIons; i++) {
+    const double startX = RndmGaussian(1.25, 0.03);
+    const double startY = yCathode;
+    driftline.DriftElectron(startX, yCathode, 0, 0);
+    double x1, y1, z1, t1;
+    int status = 0;
+    driftline.GetEndPoint(x1, y1, z1, t1, status);
+    std::cout<<"("<<x1<<", "<<y1<<")"<<" status: "<<status<<std::endl;;
+    if (y1<=1.62&&x1>=1.25-0.5&&x1<1.25+0.5) {
+      ++plane;
+    }
+  }
+
+  if (yesGrid==true) {
+    float gridTransparency = static_cast<float>(plane)/nIons;
+    std::cout<<"Total initial electrons: "<<nIons<<std::endl;
+    std::cout<<"Total final electrons: "<<plane<<std::endl;
+    std::cout<<"Grid transparency: "<<gridTransparency<<std::endl;
+  }
+ 
+  ViewCell cellView0;
+  cellView0.SetComponent(&cmp);
+  cellView0.SetArea(-0.5, -0.5, ringThickness + ringInnerDiam + 0.5, yCathode + 0.5);
+  cellView0.EnableWireMarkers(false);
+  cellView0.Plot2d();
+  
+  driftView.SetArea(-0.5, -0.5, ringThickness + ringInnerDiam + 0.5, yCathode + 0.5);
+  driftView.SetCanvas(cellView0.GetCanvas());
+  driftView.Plot(true, false);
+  
+  //plot induced current on anode
+  ViewSignal signalView;
+  signalView.SetSensor(&sensor);
+  TCanvas inducedCurrent("inducedCurrent", "Induced Current over Time", 800, 600);
+  signalView.SetCanvas(&inducedCurrent);
+  signalView.PlotSignal("anode");
+
+  if (saveData==true) {
+    std::ofstream outfile;
+    outfile.open("/home/claire/COMSOL_test/signal.txt", std::ios::out);
+    for (unsigned int i = 0; i < nSteps; ++i) {
+      const double t = i;
+      const double f = sensor.GetSignal("anode", i);
+      outfile << t << "  " << f << "  "  << "\n";
+    }
+    outfile.close();
+  }
+  
+  //plot potential
+  TCanvas* canvas = new TCanvas("potentialCanvas", "Potential and Cell View", 800, 600);
+  
+  ViewField fieldView;
+  fieldView.SetCanvas(canvas);
+  fieldView.SetComponent(&cmp);
+  fieldView.SetArea(-0.5, -0.5, ringThickness + ringInnerDiam + 0.5, yCathode + 0.5);
+  fieldView.SetVoltageRange(vCathode, vAnode);
+  fieldView.Plot("v", "COLZ");
+
+  ViewCell cellView;
+  cellView.SetCanvas(canvas);
+  cellView.SetComponent(&cmp);
+  cellView.SetArea(-0.5, -0.5, ringThickness + ringInnerDiam + 0.5, yCathode + 0.5);
+  cellView.EnableWireMarkers(false);
+  cellView.Plot2d();
+
+  //plot electric field
+  TCanvas* canvasElectricField = new TCanvas("fieldCanvas", "Electric Field and Cell View", 800, 600);
+  
+  ViewField fieldViewElectricField;
+  fieldViewElectricField.SetCanvas(canvasElectricField);
+  fieldViewElectricField.SetComponent(&cmp);
+  fieldViewElectricField.SetArea(-0.5, -0.5, ringThickness + ringInnerDiam + 0.5, yCathode + 0.5);
+  fieldViewElectricField.SetElectricFieldRange(0, 1000);
+  fieldViewElectricField.Plot("e", "COLZ");
+
+  ViewCell cellViewElectricField;
+  cellViewElectricField.SetCanvas(canvasElectricField);
+  cellViewElectricField.SetComponent(&cmp);
+  cellViewElectricField.SetArea(-0.5, -0.5, ringThickness + ringInnerDiam + 0.5, yCathode + 0.5);
+  cellViewElectricField.EnableWireMarkers(false);
+  cellViewElectricField.Plot2d();
+
+  //plot electric field lines
+  TCanvas* fieldLinesCanvas = new TCanvas("fieldLinesCanvas", "Electric Field Lines", 800, 600);
+
+  ViewField fieldLinesView;
+  fieldLinesView.SetCanvas(fieldLinesCanvas);
+  fieldLinesView.SetComponent(&cmp);
+  fieldLinesView.SetArea(-0.5, -0.5, ringThickness + ringInnerDiam + 0.5, yCathode + 0.5);
+
+  constexpr int numFieldLines = 75;
+  constexpr  double fieldGap = ringInnerDiam/numFieldLines;
+
+  std::vector<double> x0;
+  std::vector<double> y0;
+  std::vector<double> z0;
+
+  for (int i=0; i<numFieldLines; i++) {
+    x0.push_back(0+i*fieldGap);
+    y0.push_back(yCathode);
+    z0.push_back(0.0);
+  }
+  
+  fieldLinesView.PlotFieldLines(x0, y0, z0, true, true, kOrange-3);
+
+  ViewCell cellView2;
+  cellView2.SetCanvas(fieldLinesCanvas);
+  cellView2.SetComponent(&cmp);
+  cellView2.SetArea(-0.5, -0.5, ringThickness + ringInnerDiam + 0.5, yCathode + 0.5);
+  cellView2.EnableWireMarkers(false);
+  cellView2.Plot2d();
+
+  ComponentGrid grid;
+  grid.SetMesh(150, 150, 1, 1.25-0.25, 1.25+0.25, 0, yCathode, 0, 0.001);
+  grid.SaveElectricField(&cmp, "/home/claire/COMSOL_test/field.txt","xyz");
+
+  app.Run(true);
+}
