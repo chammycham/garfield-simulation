@@ -1,0 +1,95 @@
+#include <cstdlib>
+#include <iostream>
+#include <fstream>
+
+#include <TApplication.h>
+#include <TCanvas.h>
+#include <TH1F.h>
+
+#include "Garfield/ViewCell.hh"
+#include "Garfield/ViewSignal.hh"
+#include "Garfield/ComponentAnalyticField.hh"
+#include "Garfield/ViewField.hh"
+#include "Garfield/MediumMagboltz.hh"
+#include "Garfield/Sensor.hh"
+#include "Garfield/AvalancheMicroscopic.hh"
+#include "Garfield/AvalancheMC.hh"
+#include "Garfield/ViewDrift.hh"
+#include "Garfield/DriftLineRKF.hh"
+#include "Garfield/Random.hh"
+#include "Garfield/ComponentGrid.hh"
+
+using namespace Garfield;
+
+int main(int argc, char * argv[]) {
+
+  TApplication app("app", &argc, argv);
+
+  //variables to change
+  //grid pitch (30 lpi or 70 lpi)
+  constexpr bool lpi30 = false;
+  //number of rings
+  constexpr int  numRings = 13;
+  //drift length [cm]
+  constexpr double driftLength = 5.;
+  //inner diameter of the rings [cm]
+  constexpr double ringInnerDiam = 2.5;
+  //thickness of the rings [cm]
+  constexpr double ringThickness = 0.1;
+  //gap between the grid and the first ring [cm]
+  constexpr double egGap = 0.162;
+  // wire diameter [cm]
+  constexpr double gridDiam = 0.0035;
+  //electric field between the anode grid and cathode grid [V/cm]
+  constexpr double eGG = 400;
+  //electric field between the anode and the grid [V/cm]
+  constexpr double eAG = 800;
+  //electric field between the cathode and the grid [V/cm]
+  constexpr double eCG = 200;
+
+
+  //grid spacing [cm]
+  constexpr double gridGap = lpi30 ? 0.0846: 0.0363;
+  // number of grid wires
+  constexpr int numGridWire = (ringInnerDiam-ringThickness)/gridGap;
+  //spacing between the rings
+  constexpr double ringGap = driftLength/(numRings+1);
+  
+  // voltage settings [V], lower grid set at ground
+  constexpr double vAnode = eAG*egGap;
+  constexpr double vLowerGrid = 0;
+  constexpr double vUpperGrid = -(driftLength*eGG);
+  constexpr double vCathode = vUpperGrid - eCG*egGap;  
+
+  // yGrid placement [cm]
+  constexpr double yLowerGrid = egGap;
+  constexpr double yUpperGrid = driftLength + egGap;
+
+   //electrode placement [cm]
+  constexpr double yCathode = yUpperGrid + egGap;
+  constexpr double yAnode = 0.;
+  
+  //setup the gas
+  MediumMagboltz gas;
+
+  //set the temperature [K] and pressure [Torr].
+  //100% xenon gas
+  gas.SetComposition("xe", 100.);
+  //temperature [K]
+  gas.SetTemperature(120);
+  //pressure [Torr]
+  gas.SetPressure(1125.);
+  //initialize table of scattering rates (called internally when a collision rate is requested and the gas mixture or other parameters have changed)
+  gas.Initialise(false);  
+
+
+  gas.SetFieldGrid(200., 800, 10, false);
+  const int ncol1 = 10;
+
+  gas.EnableAutoEnergyLimit(false);
+  gas.SetMaxElectronEnergy(100.);
+  
+  gas.GenerateGasTable(ncol1);
+  gas.WriteGasFile("xe1125Torr.gas");
+
+}
